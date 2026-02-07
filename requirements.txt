@@ -1,0 +1,7 @@
+langchain-openai
+langchain-core
+langgraph
+python-dotenv
+bedrock-agentcore
+supabase
+typing-extensions

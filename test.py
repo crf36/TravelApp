@@ -4,11 +4,14 @@ import json
 import uuid
 
 def call_travel_agent(session_id: str, user_prompt: str):
+    # Retrieve AWS user credentials from .env file
     load_dotenv()
 
+    # Connect to AgentCore and create payload
     client = boto3.client('bedrock-agentcore', region_name='us-east-1')
     payload = json.dumps({"prompt": user_prompt, "session_id": session_id})
 
+    # Call AgentCore endpoint
     response = client.invoke_agent_runtime(
         agentRuntimeArn='arn:aws:bedrock-agentcore:us-east-1:973030239480:runtime/TravelAgent-OWS4r078E8',
         runtimeSessionId=session_id,

@@ -16,29 +16,20 @@ load_dotenv()
 #############################################################################
 # SETUP
 #############################################################################
+# region
 
 app = BedrockAgentCoreApp()
+model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-model = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0
-)
-
+# Set up Supabase client
 url = os.getenv("SUPABASE_URL")
 key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(url, key)
 
-#############################################################################
-# STATE
-#############################################################################
-
+# Define state dictionary
 class MessagesState(TypedDict):
     messages: Annotated[list[AnyMessage], operator.add]
     llm_calls: int
-
-#############################################################################
-# SYSTEM PROMPT
-#############################################################################
 
 SYSTEM_PROMPT = (
     "You are a helpful travel assistant.\n"
@@ -50,10 +41,12 @@ SYSTEM_PROMPT = (
     "- Do not fabricate facts.\n"
     "- Keep responses concise but informative."
 )
+# endregion
 
 #############################################################################
 # TOOLS
 #############################################################################
+# region
 
 @tool
 def webscrape() -> str:
@@ -63,10 +56,12 @@ def webscrape() -> str:
 tools = [webscrape]
 tools_by_name = {tool.name: tool for tool in tools}
 model_with_tools = model.bind_tools(tools)
+# endregion
 
 #############################################################################
 # NODES
 #############################################################################
+# region
 
 def llm_call(state: dict):
     """LLM decides whether to call a tool or not"""
@@ -80,7 +75,6 @@ def llm_call(state: dict):
 
 def tool_node(state: dict):
     """Execute tool calls requested by the LLM"""
-
     tool_messages = []
     last_message = state["messages"][-1]
 
@@ -99,7 +93,6 @@ def tool_node(state: dict):
 
 def should_continue(state: MessagesState) -> Literal["tool_node", END]:
     """Decide if we should continue the loop or stop"""
-
     if state["llm_calls"] >= 5:
         return END
     
@@ -109,10 +102,12 @@ def should_continue(state: MessagesState) -> Literal["tool_node", END]:
         return "tool_node"
 
     return END
+# endregion
 
 #############################################################################
 # STATE GRAPH
 #############################################################################
+# region
 
 builder = StateGraph(MessagesState)
 builder.add_node("llm_call", llm_call)
@@ -126,12 +121,15 @@ builder.add_conditional_edges(
 )
 
 agent = builder.compile()
+# endregion
 
 #############################################################################
 # HELPERS
 #############################################################################
+# region
 
 def db_row_to_message(row):
+    """Determine message type based on role; convert row to message object"""
     role = row["role"]
     content = row["content"]
 
@@ -147,6 +145,7 @@ def db_row_to_message(row):
         raise ValueError(f"Unknown role: {role}")
     
 def update_session_summary(session_id: str, recent_messages: list[AnyMessage], current_summary: str):
+    """Send messages and current summary to LLM, get an updated summary, and store it in the DB"""
     conversation_text = "\n".join(
         f"{type(m).__name__.replace('Message','').lower()}: {m.content}"
         for m in recent_messages
@@ -188,14 +187,16 @@ def update_session_summary(session_id: str, recent_messages: list[AnyMessage], c
     ).execute()
 
     return new_summary
-
+# endregion
 
 #############################################################################
 # AGENTCORE JSON ENTRYPOINT
 #############################################################################
+# region
 
 @app.entrypoint
 def handler(event: dict):
+    # Event is the JSON object passed as the payload
     user_input = event.get("prompt")
     session_id = event.get("session_id")
 
@@ -213,6 +214,7 @@ def handler(event: dict):
         .execute()
     )
 
+    # If no session found, create one. Otherwise, get summary and last update time
     if not db_session.data or len(db_session.data) == 0:
         supabase.table("sessions").insert({"session_id": session_id}).execute()
         summary = ""
@@ -253,42 +255,36 @@ def handler(event: dict):
     messages.extend(history_messages)
     messages.append(HumanMessage(content=user_input))
 
+    # Call the agent and pass in the state
     result = agent.invoke({
         "messages": messages,
         "llm_calls": 0
     })
     
+    # Get the last message in the agent's response (the output)
     final_message = result["messages"][-1]
 
+    # Store user's prompt and agent's resposne
     supabase.table("messages").insert([
-        # Include this first record when testing. Otherwise, include it in the call to the endpoint
-        {
-            "session_id": session_id,
-            "role": "user",
-            "content": user_input
-        },
-        {
-            "session_id": session_id,
-            "role": "assistant",
-            "content": final_message.content
-        }
+        { "session_id": session_id, "role": "user", "content": user_input },
+        { "session_id": session_id, "role": "assistant", "content": final_message.content }
     ]).execute()
 
-    if last_summary_time:
-        unsummarized_db_messages = (
-            supabase.table("messages")
-            .select("role, content, created_at")
-            .eq("session_id", session_id)
-            .gt("created_at", last_summary_time)
-            .order("created_at", desc=False)
-            .execute()
-        )
-        unsummarized_messages = [db_row_to_message(m) for m in unsummarized_db_messages.data]
-
-        if len(unsummarized_messages) >= 10:
-            update_session_summary(session_id, unsummarized_messages, summary)
+    # If there are at least 10 messages since last summary, update the session summary
+    unsummarized_db_messages = (
+        supabase.table("messages")
+        .select("role, content, created_at")
+        .eq("session_id", session_id)
+        .gt("created_at", last_summary_time)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    unsummarized_messages = [db_row_to_message(m) for m in unsummarized_db_messages.data]
+    if len(unsummarized_messages) >= 10:
+        update_session_summary(session_id, unsummarized_messages, summary)
 
     return {"output": final_message.content}
+# endregion
 
 #############################################################################
 # APP INITIALIZER

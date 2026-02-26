@@ -13,3 +13,6 @@ dist
 build
 README.md
 test.py
+*.jsonl
+*.json
+ai_webscraper/ta_cache/

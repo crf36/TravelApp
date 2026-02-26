@@ -5,3 +5,15 @@ python-dotenv
 bedrock-agentcore
 supabase
 typing-extensions
+
+requests
+beautifulsoup4
+tldextract
+selenium
+webdriver-manager
+boto3
+python-dotenv
+pydantic
+openai
+supabase
+geopy

@@ -6,6 +6,8 @@ bedrock-agentcore
 supabase
 typing-extensions
 
+boto3
+
 requests
 beautifulsoup4
 tldextract

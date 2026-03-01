@@ -9,8 +9,7 @@ from typing import Literal
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from datetime import datetime, timezone
-from ai_webscraper.main_scraper import run_main_scraper
-import operator, os, json #, subprocess, sys
+import operator, os, json, boto3
 
 # Only used when running locally
 load_dotenv()
@@ -267,9 +266,7 @@ def search_attractions_tool(metadata: dict) -> str:
 
 @tool
 def get_place_tool(city: str = None) -> str:
-    """
-    Check if a city already exists in the DB.
-    """
+    """Check if a city already exists in the DB."""
     if not city:
         return json.dumps({"exists": False, "reason": "No city provided"})
 
@@ -282,18 +279,15 @@ def get_place_tool(city: str = None) -> str:
     )
 
     if result.data:
-        print(f"Place exists: {result.data}")
         return "The place exists in the DB and can be queried for attractions."
     else:
-        print(f"Place doesn't exist. Running diagnostic for {city}...")
-
-        # result = subprocess.Popen(
-        #     [sys.executable, "-u", "-m", "ai_webscraper.main_scraper", city],
-        #     stdout=None,
-        #     stderr=None,
-        #     cwd=os.getcwd()
-        # )
-        return "Diagnostic complete. Check your primary terminal console for output."
+        lambda_client = boto3.client("lambda", region_name=os.getenv("AWS_REGION"))
+        lambda_client.invoke(
+            FunctionName=os.getenv("SCRAPER_LAMBDA_NAME"),
+            InvocationType="Event",
+            Payload=json.dumps({"city": city}).encode()
+        )
+        return "City not found. It's being added and will be available in 10-15 minutes."
 
 # Define Available tools
 tools = [update_metadata_tool, search_attractions_tool, get_place_tool]

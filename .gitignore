@@ -19,6 +19,3 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-*.jsonl
-*.json
-ai_webscraper/ta_cache/

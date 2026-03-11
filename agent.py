@@ -101,7 +101,7 @@ SYSTEM_PROMPT = (
     "  - longitude (float, estimated coordinates of the attraction)\n"
     "  - popularity_score (float, 0-100 estimate of how popular this attraction is)\n"
     "  - raw_data (dict with any relevant details such as hours, price_text, website, tips)\n\n"
-)
+) 
 
 # endregion
 

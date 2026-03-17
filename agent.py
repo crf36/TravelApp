@@ -1,4 +1,4 @@
-from bedrock_agentcore.runtime import BedrockAgentCoreApp
+import json, uuid, boto3, os, traceback, requests, math, operator
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import AnyMessage, SystemMessage, ToolMessage, HumanMessage, AIMessage
@@ -6,27 +6,25 @@ from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END
 from typing_extensions import TypedDict, Annotated, Any, Dict, Optional, List
 from typing import Literal
-from dotenv import load_dotenv
 from supabase import create_client, Client
 from datetime import datetime, timezone
-import operator, os, json, uuid, requests, math, boto3
 
-load_dotenv()
 
 #############################################################################
 # SETUP
 #############################################################################
 # region
 
-app = BedrockAgentCoreApp()
-model = ChatOpenAI(model="gpt-4o", temperature=0)
+EXPECTED_API_KEY = os.environ.get("AGENT_API_KEY")
+
+model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 openai_client = OpenAI()
 
-url = os.getenv("SUPABASE_URL")
-key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+url = os.environ.get("SUPABASE_URL")
+key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(url, key)
 
-lambda_client = boto3.client("lambda", region_name=os.getenv("AWS_REGION", "us-east-1"))
+lambda_client = boto3.client("lambda", region_name=os.environ.get("AWS_REGION", "us-east-1"))
 
 # endregion
 
@@ -73,6 +71,20 @@ SYSTEM_PROMPT = (
     "- Always call save_itinerary_tool BEFORE responding to the user.\n"
     "- Always confirm the change to the user after saving.\n"
     "- Never call save_itinerary_tool unless the user has explicitly requested a change.\n"
+    "- ALWAYS call search_attractions_tool before adding any attractions to the itinerary "
+    "to ensure you are using real attractionId values from the database. Never guess or "
+    "infer attractionId values. Previous search results are also provided in your context "
+    "under 'Most recent attraction search results' — you may use those IDs directly if the "
+    "attraction is already listed there.\n"
+    "- attractionId must always be the exact integer attraction_id field from the search results "
+    "provided in your context or from search_attractions_tool results. "
+    "Never invent, guess, or increment IDs. If you are unsure of an attractionId, call search_attractions_tool again.\n"
+    "- When the user selects attractions by number or name, always match them back to the "
+    "exact attraction from the most recent search_attractions_tool results by name, then "
+    "use the id field from that result as the attractionId. Never use the list position "
+    "number as the attractionId.\n"
+    "- Before saving any stops to the itinerary, verify each attractionId by cross-referencing "
+    "the attraction name against the search_attractions_tool results from the current session.\n"
     "- Never save a stop with a null or missing attractionId.\n\n"
 
     "Generating an itinerary across multiple destinations:\n"
@@ -94,6 +106,8 @@ class MessagesState(TypedDict):
     llm_calls: int
     metadata: Dict[str, Any]
     itinerary: Optional[Dict[str, Any]]
+    itinerary_saved: bool
+    last_search_results: List[Dict[str, Any]]
 
 class Metadata(TypedDict, total=False):
     city: Optional[str]
@@ -127,7 +141,7 @@ def db_row_to_message(row):
     else:
         raise ValueError(f"Unknown role: {role}")
 
-def update_session_summary(session_id: str, recent_messages: list[AnyMessage], current_summary: str):
+def update_session_summary(session_id: str, recent_messages: list, current_summary: str):
     """Send messages and current summary to LLM, get an updated summary, and store it in the DB"""
     conversation_text = "\n".join(
         f"{type(m).__name__.replace('Message','').lower()}: {m.content}"
@@ -135,41 +149,38 @@ def update_session_summary(session_id: str, recent_messages: list[AnyMessage], c
     )
 
     summarization_prompt = [
-        SystemMessage(
-            content=(
-                "You are a summarization assistant.\n"
-                "Produce a NEW, COMPLETE summary of the conversation.\n\n"
-                "Rules:\n"
-                "- Use the existing summary only as background context.\n"
-                "- Integrate information from ALL recent messages.\n"
-                "- Do NOT copy the existing summary.\n"
-                "- Do NOT append or label sections.\n"
-                "- Focus on the overall conversation, not just the last message.\n"
-                "- Output ONLY the final summary text."
-                "- Maximum 120 words."
-            )
-        ),
+        SystemMessage(content=(
+            "You are a summarization assistant.\n"
+            "Produce a NEW, COMPLETE summary of the conversation.\n\n"
+            "Rules:\n"
+            "- Use the existing summary only as background context.\n"
+            "- Integrate information from ALL recent messages.\n"
+            "- Do NOT copy the existing summary.\n"
+            "- Do NOT append or label sections.\n"
+            "- Focus on the overall conversation, not just the last message.\n"
+            "- Output ONLY the final summary text."
+            "- Maximum 120 words."
+        )),
         HumanMessage(content=f"Existing summary (context only):\n{current_summary}"),
         HumanMessage(content=f"Recent conversation messages:\n{conversation_text}"),
     ]
-
     summary_result = model.invoke(summarization_prompt)
     new_summary = summary_result.content
 
     supabase.table("sessions").upsert(
         {
-            "session_id": session_id,
-            "summary": new_summary,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "session_id": session_id, 
+            "summary": new_summary, 
+            "updated_at": datetime.now(timezone.utc).isoformat()
         },
         on_conflict="session_id",
     ).execute()
 
     return new_summary
 
-def embed(text: str) -> list[float]:
+def embed(text: str) -> list:
     response = openai_client.embeddings.create(
-        input=[text],
+        input=[text], 
         model="text-embedding-3-small"
     )
     return response.data[0].embedding
@@ -178,7 +189,7 @@ def get_next_canonical_id() -> int:
     result = supabase.table("attraction").select("canonical_id").order("canonical_id", desc=True).limit(1).execute()
     if result.data and result.data[0].get("canonical_id"):
         return result.data[0]["canonical_id"] + 1
-    raise ValueError("Could not determine next canonical_id — attraction table may be empty or canonical_id is null")
+    raise ValueError("Could not determine next canonical_id")
 
 def geocode(location: str) -> tuple[float, float] | None:
     api_key = os.getenv("GOOGLE_MAPS_API_KEY")
@@ -193,9 +204,9 @@ def geocode(location: str) -> tuple[float, float] | None:
     print(f"[geocode] Failed for '{location}': {data['status']}")
     return None
 
-def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float | None:
+def haversine_distance(lat1, lon1, lat2, lon2):
     try:
-        R = 6371  # Earth's radius in kilometers
+        R = 6371
         lat1, lon1, lat2, lon2 = map(math.radians, [float(lat1), float(lon1), float(lat2), float(lon2)])
         dlat = lat2 - lat1
         dlon = lon2 - lon1
@@ -399,6 +410,8 @@ def add_attractions_to_db_tool(place_id: str, attractions: list) -> str:
     - longitude (float)
     - popularity_score (float, 0-100)
     - raw_data (dict with any relevant details such as hours, price_text, website, tips)
+
+    - place_id must be a real integer from check_if_place_exists_tool or add_place_to_db_tool results, never a placeholder string
     """
     print(f"\n[add_attractions_to_db_tool] Called — place_id={place_id}, {len(attractions)} attractions provided")
 
@@ -485,6 +498,13 @@ def save_itinerary_tool(itinerary_id: str, days: Optional[list] = None, trip_nam
     """
     Saves updates to the itinerary. Pass only the fields that need to be changed — omit the rest.
     Never call this unless the user has explicitly requested a change.
+    Creates the itinerary if it doesn't exist, otherwise updates it.
+
+    IMPORTANT: The following fields are required and must ALWAYS be included in every save:
+    - trip_name: use a descriptive name based on the destinations if not already set
+    - start_date: use a reasonable default (e.g. '2026-01-01') if not specified by the user
+    - end_date: use a reasonable default if not specified by the user
+    - unscheduled: pass [] if there are no unscheduled attractions
 
     - itinerary_id: the id of the itinerary to update, found in the itinerary context
     - days: full updated days array. Must include ALL days even if unchanged. Structure:
@@ -520,7 +540,10 @@ def save_itinerary_tool(itinerary_id: str, days: Optional[list] = None, trip_nam
         return json.dumps({"success": False, "reason": "No fields provided to update"})
 
     try:
-        supabase.table("itinerary").update(updates).eq("itinerary_id", itinerary_id).execute()
+        supabase.table("itinerary").upsert(
+            {"itinerary_id": itinerary_id, **updates},
+            on_conflict="itinerary_id"
+        ).execute()
         print(f"[save_itinerary_tool] Saved successfully — fields: {list(updates.keys())}")
         return json.dumps({"success": True, "updated_fields": list(updates.keys())})
     except Exception as e:
@@ -542,7 +565,7 @@ model_with_tools = model.bind_tools(tools, parallel_tool_calls=False)
 # endregion
 
 #############################################################################
-# NODES
+# GRAPH NODES
 #############################################################################
 # region
 
@@ -558,6 +581,8 @@ def tool_node(state: dict):
     tool_messages = []
     last_message = state["messages"][-1]
     new_metadata = state.get("metadata", {})
+    itinerary_saved = state.get("itinerary_saved", False)
+    last_search_results = state.get("last_search_results", [])
 
     for tool_call in last_message.tool_calls:
         print(f"\n[tool_node] Dispatching: {tool_call['name']}")
@@ -565,6 +590,9 @@ def tool_node(state: dict):
         tool = tools_by_name.get(tool_call["name"])
         if not tool:
             continue
+
+        if tool_call["name"] == "save_itinerary_tool":
+            itinerary_saved = True
 
         if tool_call["name"] == "search_attractions_tool":
             args = {"metadata": new_metadata}
@@ -592,15 +620,32 @@ def tool_node(state: dict):
             except:
                 pass
 
+        if tool_call["name"] == "search_attractions_tool":
+            try:
+                results = json.loads(observation)
+                new_results = results.get("results", [])
+
+                trimmed = [
+                {
+                    "attraction_id": r.get("attraction_id"),
+                    "attraction_name": r.get("attraction_name"),
+                    "attraction_city": r.get("attraction_city")
+                }
+                for r in new_results
+            ]
+                last_search_results = last_search_results + trimmed
+            except:
+                pass
+
         tool_messages.append(
             ToolMessage(content=observation, tool_call_id=tool_call["id"])
         )
 
-    return {"messages": tool_messages, "metadata": new_metadata}
+    return {"messages": tool_messages, "metadata": new_metadata, "itinerary_saved": itinerary_saved, "last_search_results": last_search_results}
 
 def should_continue(state: MessagesState) -> Literal["tool_node", END]:
     """Decide if we should continue the loop or stop"""
-    if state["llm_calls"] >= 10:
+    if state["llm_calls"] >= 30:
         return END
 
     last_message = state["messages"][-1]
@@ -634,161 +679,175 @@ agent = builder.compile()
 # endregion
 
 #############################################################################
-# AGENTCORE ENTRYPOINT
+# LAMBDA HANDLER
 #############################################################################
-# region
+# region 
 
-@app.entrypoint
-def handler(event: dict):
-    user_input = event.get("prompt")
-    session_id = event.get("session_id")
-    itinerary_id = event.get("itinerary_id")
+def lambda_handler(event, context):
+    try:
+        # --- Auth ---
+        headers = event.get("headers", {})
+        if headers.get("x-api-key") != EXPECTED_API_KEY:
+            return {"statusCode": 403, "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"}, "body": json.dumps({"error": "Forbidden"})}
 
-    if not user_input:
-        return {"output": "No prompt provided."}
-    if not session_id:
-        return {"output": "Missing session_id."}
+        # --- Parse body ---
+        try:
+            body = json.loads(event.get("body", "{}"))
+        except json.JSONDecodeError:
+            return {"statusCode": 400, "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"}, "body": json.dumps({"error": "Invalid JSON body"})}
 
-    db_session = (
-        supabase
-        .table("sessions")
-        .select("summary, updated_at, metadata")
-        .eq("session_id", session_id)
-        .execute()
-    )
+        user_prompt = body.get("prompt")
+        session_id = body.get("session_id", str(uuid.uuid4()))
+        itinerary_id = body.get("itinerary_id")
+        user_id = body.get("user_id")
 
-    if not db_session.data or len(db_session.data) == 0:
-        supabase.table("sessions").insert({"session_id": session_id}).execute()
-        summary = ""
-        last_summary_time = None
-        metadata = {}
-    else:
-        summary = db_session.data[0].get("summary") or ""
-        last_summary_time = db_session.data[0].get("updated_at")
-        metadata = db_session.data[0].get("metadata") or {}
+        if not user_prompt:
+            return {"statusCode": 400, "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"}, "body": json.dumps({"error": "Missing prompt"})}
 
-    db_messages = (
-        supabase
-        .table("messages")
-        .select("role, content")
-        .eq("session_id", session_id)
-        .order("created_at", desc=True)
-        .limit(10)
-        .execute()
-    )
-    recent_messages = list(reversed(db_messages.data))
-    history_messages = [
-        db_row_to_message(m) for m in recent_messages
-        if m["role"] not in ("tool",)
-    ]
+        print(f"[lambda_handler] session_id={session_id}, prompt={user_prompt[:100]}")
+        print(f"[lambda_handler] itinerary_id={itinerary_id}")
+        print(f"[lambda_handler] user_id={user_id}")
 
-    messages = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        SystemMessage(content=f"Current metadata: {json.dumps(metadata)}")
-    ]
-
-    if summary:
-        messages.append(
-            SystemMessage(
-                content=(
-                    "The following is a summary of the conversation so far. "
-                    "Use it as context, but prioritize the most recent messages.\n\n"
-                    f"{summary}"
-                )
-            )
-        )
-
-    itinerary = None
-    if itinerary_id:
-        itin_result = (
+        # --- Session ---
+        db_session = (
             supabase
-            .table("itinerary")
-            .select("*")
-            .eq("itinerary_id", itinerary_id)
-            .single()
+            .table("sessions")
+            .select("summary, updated_at, metadata, last_search_results")
+            .eq("session_id", session_id)
             .execute()
         )
-        itinerary = itin_result.data if itin_result.data else None
-        if itinerary:
-            messages.append(
-                SystemMessage(content=f"Current itinerary the user wants to edit:\n{json.dumps(itinerary, indent=2)}")
+
+        if not db_session.data or len(db_session.data) == 0:
+            supabase.table("sessions").insert({"session_id": session_id}).execute()
+            summary = ""
+            last_summary_time = None
+            metadata = {}
+            last_search_results = []
+        else:
+            summary = db_session.data[0].get("summary") or ""
+            last_summary_time = db_session.data[0].get("updated_at")
+            metadata = db_session.data[0].get("metadata") or {}
+            last_search_results = db_session.data[0].get("last_search_results") or []
+
+        # --- Message history ---
+        db_messages = (
+            supabase
+            .table("messages")
+            .select("role, content")
+            .eq("session_id", session_id)
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute()
+        )
+        recent_messages = list(reversed(db_messages.data))
+        history_messages = [db_row_to_message(m) for m in recent_messages if m["role"] != "tool"]
+
+        # --- Build messages ---
+        messages = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=f"Today's date is {datetime.now(timezone.utc).strftime('%B %d, %Y')}. Use this as context when the user mentions travel dates without specifying a year — assume the nearest future date."),
+            SystemMessage(content=f"Current metadata: {json.dumps(metadata)}")
+        ]
+
+        if summary:
+            messages.append(SystemMessage(content=f"Summary of conversation so far (use as context, prioritize recent messages):\n\n{summary}"))
+        if last_search_results:
+            messages.append(SystemMessage(content=f"Most recent attraction search results — use the attraction_id field when saving to the itinerary:\n{json.dumps(last_search_results, indent=2)}"))
+
+        # --- Load itinerary ---
+        itinerary = None
+        if itinerary_id:
+            itin_result = (
+                supabase
+                .table("itinerary")
+                .select("*")
+                .eq("itinerary_id", itinerary_id)
+                .execute()
             )
+            itinerary = itin_result.data[0] if itin_result.data else {
+                "itinerary_id": itinerary_id,
+                "user_id": user_id,
+                "days": [],
+                "unscheduled": [],
+                "place": [],
+                "trip_name": None,
+                "start_date": None,
+                "end_date": None,
+                "notes": None,
+            }
+            messages.append(SystemMessage(content=f"Current itinerary the user wants to edit:\n{json.dumps(itinerary, indent=2)}"))
 
-    messages.extend(history_messages)
-    messages.append(HumanMessage(content=user_input))
+        messages.extend(history_messages)
+        messages.append(HumanMessage(content=user_prompt))
 
+        # --- Run agent ---
+        result = agent.invoke({
+            "messages": messages, 
+            "llm_calls": 0, 
+            "metadata": metadata, 
+            "itinerary": itinerary,
+            "itinerary_saved": False,
+            "last_search_results": last_search_results
+        })
 
-    result = agent.invoke({
-        "messages": messages,
-        "llm_calls": 0,
-        "metadata": metadata,
-        "itinerary": itinerary
-    })
+        # --- Persist metadata ---
+        new_search_results = result.get("last_search_results", [])
 
-    updated_metadata = result.get("metadata", metadata)
-    supabase.table("sessions").update({
-        "metadata": updated_metadata
-    }).eq("session_id", session_id).execute()
+        supabase.table("sessions").update({
+            "metadata": result.get("metadata", metadata),
+            **({"last_search_results": new_search_results} if new_search_results else {})
+        }).eq("session_id", session_id).execute()
 
-    final_message = result["messages"][-1]
+        # --- Final message ---
+        final_message = result["messages"][-1]
+        output = final_message.content or "I've made the updates! Let me know if you'd like any other changes."
 
-    supabase.table("messages").insert([
-        {"session_id": session_id, "role": "user", "content": user_input},
-        {"session_id": session_id, "role": "assistant", "content": final_message.content}
-    ]).execute()
+        # --- Persist messages ---
+        supabase.table("messages").insert([
+            {"session_id": session_id, "role": "user", "content": user_prompt},
+            {"session_id": session_id, "role": "assistant", "content": output}
+        ]).execute()
 
-    query = (
-        supabase.table("messages")
-        .select("role, content, created_at")
-        .eq("session_id", session_id)
-        .order("created_at", desc=False)
-    )
+        # --- Summarize if needed ---
+        query = (
+            supabase
+            .table("messages")
+            .select("role, content, created_at")
+            .eq("session_id", session_id)
+            .order("created_at", desc=False)
+        )
 
-    if last_summary_time:
-        query = query.gt("created_at", last_summary_time)
+        if last_summary_time:
+            query = query.gt("created_at", last_summary_time)
 
-    unsummarized_db_messages = query.execute()
-    unsummarized_messages = [db_row_to_message(m) for m in unsummarized_db_messages.data]
+        unsummarized = query.execute()
+        unsummarized_messages = [db_row_to_message(m) for m in unsummarized.data]
 
-    if len(unsummarized_messages) >= 10:
-        update_session_summary(session_id, unsummarized_messages, summary)
+        if len(unsummarized_messages) >= 10:
+            update_session_summary(session_id, unsummarized_messages, summary)
 
-    return {"output": final_message.content}
+        itinerary_saved = result.get("itinerary_saved", False)
 
-# endregion
+        if itinerary_saved and user_id and itinerary_id:
+            supabase.table("itinerary").update({"user_id": user_id}).eq("itinerary_id", itinerary_id).execute()
 
-#############################################################################
-# APP INITIALIZER
-#############################################################################
-# region
+        print(f"[lambda_handler] output={output}")
+        print(f"[lambda_handler] session_id={session_id}")
+        print(f"[lambda_handler] itinerary_saved={itinerary_saved}")
 
-if __name__ == "__main__":
-    app.run()
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"},
+            "body": json.dumps({"output": output, "session_id": session_id, "refresh_data": itinerary_saved})
+        }
 
-# def debug_agent_test():
-#     itinerary = "e0a4f983-d9cb-40ee-a1f3-fe3e54f8ba15"
-
-#     test_cases = [
-#         ("Itinerary Read TEST", [
-#             "Can you add a day to my itinerary and add things to do in Provo Utah to my itinerary?"
-#         ])
-#     ]
-
-#     for case_name, prompts in test_cases:
-#         session_id = str(uuid.uuid4())
-#         print(f"\n{'#'*60}")
-#         print(f"# {case_name}")
-#         print(f"# Session ID: {session_id}")
-#         print(f"{'#'*60}")
-
-#         for prompt in prompts:
-#             print("\n" + "="*60)
-#             print(f"USER: {prompt}")
-#             print("="*60)
-#             result = handler({"prompt": prompt, "session_id": session_id, "itinerary_id": itinerary})
-#             print(f"\nAGENT: {result['output']}")
-
-# if __name__ == "__main__":
-#     debug_agent_test()
-
+    except Exception as e:
+        print(f"[lambda_handler] Error: {type(e).__name__}: {str(e)}")
+        print(traceback.format_exc())
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"},
+            "body": json.dumps({"error": "Internal server error"})
+        }
+    
 # endregion

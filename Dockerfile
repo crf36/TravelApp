@@ -1,18 +1,12 @@
-FROM python:3.11-slim
+FROM public.ecr.aws/lambda/python:3.11
 
-WORKDIR /app
+WORKDIR /var/task
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
+RUN yum install -y gcc rust cargo && yum clean all
 
-# Copy requirements and install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
 COPY agent.py .
 
-# Run the agent
-CMD ["python", "agent.py"]
+CMD ["agent.lambda_handler"]

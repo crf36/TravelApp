@@ -1,4 +1,4 @@
-import json, uuid, boto3, os, traceback, requests, math, operator
+import json, uuid, boto3, os, traceback, requests, math, operator, time
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import AnyMessage, SystemMessage, ToolMessage, HumanMessage, AIMessage
@@ -8,6 +8,7 @@ from typing_extensions import TypedDict, Annotated, Any, Dict, Optional, List
 from typing import Literal
 from supabase import create_client, Client
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 #############################################################################
@@ -17,7 +18,7 @@ from datetime import datetime, timezone
 
 EXPECTED_API_KEY = os.environ.get("AGENT_API_KEY")
 
-model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+model = ChatOpenAI(model="gpt-4o", temperature=0)
 openai_client = OpenAI()
 
 url = os.environ.get("SUPABASE_URL")
@@ -25,6 +26,12 @@ key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(url, key)
 
 lambda_client = boto3.client("lambda", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+
+class MessagesState(TypedDict):
+    messages: Annotated[list[AnyMessage], operator.add]
+    llm_calls: int
+    itinerary: Optional[Dict[str, Any]]
+    itinerary_saved: bool
 
 # endregion
 
@@ -36,87 +43,50 @@ lambda_client = boto3.client("lambda", region_name=os.environ.get("AWS_REGION", 
 SYSTEM_PROMPT = (
     "You are an expert travel assistant helping users discover attractions, plan trips, "
     "and explore destinations around the world. Your goal is to provide genuinely helpful, "
-    "accurate, and personalized travel guidance.\n\n"
+    "accurate, and personalized travel guidance and help users build an itinerary.\n\n"
 
-    "You have access to a database of attractions and the following tools:\n"
-    "- update_metadata_tool: Sets the current search context.\n"
-    "- check_if_place_exists_tool: Checks if a destination exists in the database.\n"
-    "- add_place_to_db_tool: Adds a new destination to the database.\n"
-    "- search_attractions_tool: Searches for attractions matching the current context.\n"
-    "- add_attractions_to_db_tool: Saves a structured list of attractions to the database.\n"
+    "You have access to the following tools:\n"
+    "- resolve_attractions_tool: Resolves attractions to real database IDs, checking for duplicates and creating new records as needed. Call this before saving to the itinerary.\n"
     "- save_itinerary_tool: Saves updates to the itinerary.\n\n"
 
-    "General Rules:\n"
-    "- Have a natural conversation to understand the user's destination and preferences before searching.\n"
-    "- Once you have a destination and a general sense of what they're looking for, proceed to search.\n"
-    "- If a city name is ambiguous, ask the user to clarify the state or country before proceeding.\n\n"
+    "Discovery:\n"
+    "- Have a natural conversation to understand the user's destination and preferences.\n"
+    "- Suggest attractions freely from your own knowledge — do NOT call any tools during discovery.\n"
+    "- When presenting attractions, show a maximum of 10 and select the most relevant based on the user's preferences.\n\n"
 
-    "Tool Flow — follow this order when ready to search:\n"
-    "1. Call update_metadata_tool with the destination and preferences.\n"
-    "2. Call check_if_place_exists_tool.\n"
-    "3a. If exists=false: call add_place_to_db_tool, then add_attractions_to_db_tool "
-    "with suggested attractions BEFORE responding to the user.\n"
-    "3b. If exists=true: call search_attractions_tool.\n"
-    "4. If search_attractions_tool returns valid_attractions_found=false, call "
-    "add_attractions_to_db_tool with attractions NOT in existing_attraction_names."
-    "BEFORE responding to the user\n"
-    "5. After all tool calls are complete, respond to the user with the attraction suggestions.\n"
-    "6. When presenting attractions, show a maximum of 10. If more are returned, select the "
-    "most relevant based on the user's preferences.\n\n"
+    "Saving to Itinerary:\n"
+    "- When the user is ready to save attractions, call resolve_attractions_tool with ALL attractions they want to add.\n"
+    "- When the user selects attractions by number from your list, include all selected attractions in a single call.\n"
+    "- Each attraction must use the nearest large, well-known city name — never an island, region, or the attraction name itself.\n"
+    "- After resolve_attractions_tool returns, use the exact attraction_id values it provides in save_itinerary_tool.\n"
+    "- Custom events (e.g. breakfast, travel, swimming) can be added directly to days without calling resolve_attractions_tool. "
+        "Use a large random negative integer for attractionId (e.g. -1774315440974) and set attractionName to the event name. "
+        "Use different attraction_ids for each custom event (even if there is another event just like it)\n"
+    "- Always call resolve_attractions_tool BEFORE save_itinerary_tool.\n"
+    "- Always call save_itinerary_tool BEFORE responding to the user.\n"
+    "- Always confirm the saved itinerary to the user after saving.\n"
+    "- When displaying times to the user, always use 12-hour AM/PM format (e.g. 9:00 AM, 2:30 PM).\n\n"
 
     "Itinerary Editing:\n"
-    "- If an itinerary is provided in your context, the user wants to edit it.\n"
-    "- When the user requests any change, call save_itinerary_tool with only the fields "
-    "that need to be updated.\n"
-    "- Always call save_itinerary_tool BEFORE responding to the user.\n"
-    "- Always confirm the change to the user after saving.\n"
+    "- If an itinerary is provided in your context, the user may want to edit it.\n"
+    "- When adding attractions, always call resolve_attractions_tool first.\n"
+    "- When making changes that don't modify the days or unscheduled field (dates, trip name, notes), call save_itinerary_tool directly.\n"
     "- Never call save_itinerary_tool unless the user has explicitly requested a change.\n"
-    "- ALWAYS call search_attractions_tool before adding any attractions to the itinerary "
-    "to ensure you are using real attractionId values from the database. Never guess or "
-    "infer attractionId values. Previous search results are also provided in your context "
-    "under 'Most recent attraction search results' — you may use those IDs directly if the "
-    "attraction is already listed there.\n"
-    "- attractionId must always be the exact integer attraction_id field from the search results "
-    "provided in your context or from search_attractions_tool results. "
-    "Never invent, guess, or increment IDs. If you are unsure of an attractionId, call search_attractions_tool again.\n"
-    "- When the user selects attractions by number or name, always match them back to the "
-    "exact attraction from the most recent search_attractions_tool results by name, then "
-    "use the id field from that result as the attractionId. Never use the list position "
-    "number as the attractionId.\n"
-    "- Before saving any stops to the itinerary, verify each attractionId by cross-referencing "
-    "the attraction name against the search_attractions_tool results from the current session.\n"
     "- Never save a stop with a null or missing attractionId.\n\n"
 
-    "Generating an itinerary across multiple destinations:\n"
-    "- Loop through each city in the itinerary's place field one at a time.\n"
-    "- For each city call update_metadata_tool, check_if_place_exists_tool, and "
-    "search_attractions_tool sequentially before moving to the next city.\n"
-    "- Only call save_itinerary_tool after all cities have been searched.\n"
+    "save_itinerary_tool Rules:\n"
+    "- Only pass fields that are actually changing. Omit everything else — unchanged fields will be preserved automatically.\n"
+    "- trip_name: descriptive name based on destinations if not already set.\n"
+    "- start_date / end_date: use nearest future dates if not specified.\n"
+    "- days: only pass if modifying the schedule. Must include ALL days even if only one changed. "
+        "Pass an empty array [] if all days are being cleared. Each stop: {attractionId, startTime (HH:MM), durationMinutes}.\n"
+    "- unscheduled: only pass if explicitly adding or removing items. "
+        "Pass an empty array [] if all items are being removed. "
+        "When scheduling an unscheduled attraction onto a day, pass both the updated days AND updated unscheduled with that attraction removed.\n"
+    "- When adding or removing days, always update start_date, end_date, and place together.\n"
+    "- place: list of cities the user explicitly mentioned as destinations, each with placeName (str) and placeCountry (str). Do not add nearby cities even if an attraction is technically located there. Do not include placeId — it is resolved automatically.\n"
+    "- If there are more attractions than can fit in the scheduled days, place the remaining ones in unscheduled rather than dropping them.\n"
 )
-
-# endregion
-
-#############################################################################
-# TYPE DEFINITIONS
-#############################################################################
-# region
-
-class MessagesState(TypedDict):
-    messages: Annotated[list[AnyMessage], operator.add]
-    llm_calls: int
-    metadata: Dict[str, Any]
-    itinerary: Optional[Dict[str, Any]]
-    itinerary_saved: bool
-    last_search_results: List[Dict[str, Any]]
-
-class Metadata(TypedDict, total=False):
-    city: Optional[str]
-    state: Optional[str]
-    country: Optional[str]
-    price_level: Optional[int]
-    interests: List[str]
-    vibe: List[str]
-    semantic_query: str
 
 # endregion
 
@@ -124,6 +94,124 @@ class Metadata(TypedDict, total=False):
 # HELPERS
 #############################################################################
 # region
+
+def ensure_place_exists(city: str, state: Optional[str], country: str) -> Optional[int]:
+    """Check if place exists, add it if not, return place_id"""
+    print(f"[ensure_place_exists] Checking: city={city}, state={state}, country={country}")
+    
+    query = supabase.table("place").select("place_id")
+    query = query.ilike("place_city", city)
+    if state:
+        query = query.ilike("place_stateprovince", state)
+    query = query.ilike("place_countryregion", country)
+    
+    result = query.execute()
+    
+    if result.data:
+        place_id = result.data[0]["place_id"]
+        print(f"[ensure_place_exists] Found — place_id={place_id}")
+        return place_id
+    
+    print(f"[ensure_place_exists] Not found — adding")
+    coords = geocode(f"{city}, {state}, {country}" if state else f"{city}, {country}")
+    latitude, longitude = coords if coords else (None, None)
+    
+    try:
+        result = supabase.table("place").insert({
+            "place_type": ["city"],
+            "place_city": city,
+            "place_stateprovince": state,
+            "place_countryregion": country,
+            "place_latitude": latitude,
+            "place_longitude": longitude,
+        }).execute()
+        place_id = result.data[0]["place_id"]
+        print(f"[ensure_place_exists] Added — place_id={place_id}")
+        return place_id
+    except Exception as e:
+        print(f"[ensure_place_exists] Error: {e}")
+        return None
+
+def add_attraction(place_id: int, a: dict, embedding: list, canonical_id: int) -> Optional[int]:
+    """Insert a new attraction and return its attraction_id. 
+    Assumes duplicate check has already been done by the caller."""
+    name = a.get("name")
+    city = a.get("city")
+    state = a.get("state")
+    country = a.get("country")
+    description = a.get("description", "")
+
+    print(f"[add_attraction] Adding: {name}")
+
+    coords = geocode(f"{name}, {city}, {country}")
+    time.sleep(1)
+    attraction_lat = coords[0] if coords else a.get("latitude")
+    attraction_lng = coords[1] if coords else a.get("longitude")
+
+    place_result = supabase.table("place").select("place_latitude, place_longitude").eq("place_id", place_id).execute()
+    place_lat = place_result.data[0].get("place_latitude") if place_result.data else None
+    place_lng = place_result.data[0].get("place_longitude") if place_result.data else None
+
+    row = {
+        "place_id": place_id,
+        "attraction_name": name,
+        "attraction_summary": description,
+        "attraction_city": city,
+        "attraction_stateprovince": state,
+        "attraction_countryregion": country,
+        "attraction_pricelevel": a.get("price_level"),
+        "attraction_vibe": a.get("vibe", []),
+        "attraction_latitude": attraction_lat,
+        "attraction_longitude": attraction_lng,
+        "attraction_distancefromplace": haversine_distance(place_lat, place_lng, attraction_lat, attraction_lng),
+        "attraction_popularityscore": a.get("popularity_score"),
+        "attraction_rawdata": a.get("raw_data", {}),
+        "attraction_lastrefreshed": datetime.now(timezone.utc).isoformat(),
+        "attraction_embedding": embedding,
+        "attraction_reviewssummary": "Reviews summary not available",
+        "attraction_credibilitytier": 3,
+        "canonical_id": canonical_id,
+    }
+
+    try:
+        result = supabase.table("attraction").insert(row).execute()
+        attraction_id = result.data[0]["attraction_id"]
+        print(f"[add_attraction] Added — attraction_id={attraction_id}")
+
+        try:
+            lambda_client.invoke(
+                FunctionName=os.getenv("IMAGE_LAMBDA_NAME"),
+                InvocationType="Event",
+                Payload=json.dumps({"attractions": [{
+                    "attraction_id": attraction_id,
+                    "place_id": place_id,
+                    "name": name,
+                    "city": city,
+                    "country": country,
+                }]})
+            )
+        except Exception as e:
+            print(f"[add_attraction] Image Lambda error: {e}")
+
+        return attraction_id
+    except Exception as e:
+        if '23505' in str(e):
+            print(f"[add_attraction] Duplicate detected — fetching existing record for '{name}', place_id={place_id}")
+            existing = supabase.table("attraction").select("attraction_id").eq("attraction_name", name).eq("place_id", place_id).execute()
+            if existing.data:
+                return existing.data[0]["attraction_id"]
+        print(f"[add_attraction] Error: {e}")
+        return None
+
+def search_single_attraction(name, country, embedding, match_count=5):
+    client = create_client(url, key)
+    result = client.rpc("match_attractions", {
+        "query_name": name,
+        "query_embedding": embedding,
+        "query_country": country,
+        "match_count": match_count
+    }).execute()
+    return {"input_name": name, "candidates": result.data or []}
 
 def db_row_to_message(row):
     """Determine message type based on role; convert row to message object"""
@@ -192,16 +280,15 @@ def get_next_canonical_id() -> int:
     raise ValueError("Could not determine next canonical_id")
 
 def geocode(location: str) -> tuple[float, float] | None:
-    api_key = os.getenv("GOOGLE_MAPS_API_KEY")
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
-    response = requests.get(url, params={"address": location, "key": api_key})
+    response = requests.get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": location, "format": "json", "limit": 1},
+        headers={"User-Agent": "TravelApp/1.0"}
+    )
     data = response.json()
-
-    if data["status"] == "OK":
-        location = data["results"][0]["geometry"]["location"]
-        return location["lat"], location["lng"]
-    
-    print(f"[geocode] Failed for '{location}': {data['status']}")
+    if data:
+        return float(data[0]["lat"]), float(data[0]["lon"])
+    print(f"[geocode] Failed for '{location}'")
     return None
 
 def haversine_distance(lat1, lon1, lat2, lon2):
@@ -223,306 +310,148 @@ def haversine_distance(lat1, lon1, lat2, lon2):
 # region
 
 @tool
-def update_metadata_tool(city: Optional[str] = None, state: Optional[str] = None, country: Optional[str] = None, price_level: Optional[int] = None,
-    interests: Optional[List[str]] = None, vibe: Optional[List[str]] = None, semantic_query: Optional[str] = None) -> str:
+def resolve_attractions_tool(attractions: list) -> str:
     """
-    Updates the current search context. Pass only the fields that need to be set —
-    omit fields that haven't changed.
-
-    - city: full city name (e.g. 'Seattle')
-    - state: full state or province name (e.g. 'Washington'). Infer from city when unambiguous.
-    - country: full country name (e.g. 'United States', 'United Kingdom', 'United Arab Emirates').
-      Never abbreviate (not 'USA', 'UK', 'UAE').
-    - price_level: 0=free, 1=cheap, 2=moderate, 3=expensive, 4=luxury
-    - interests: list of activity types the user is interested in (e.g. ['hiking', 'museums', 'food'])
-    - vibe: list of mood or atmosphere descriptors (e.g. ['romantic', 'relaxing', 'adventurous'])
-    - semantic_query: a rich natural language phrase combining interests, vibe, and any other
-      context into a descriptive search phrase. Always include when interests or vibe are present.
-      Good examples:
-        'romantic candlelit dinner at an upscale restaurant with an intimate atmosphere'
-        'adventurous outdoor activities with stunning mountain views'
-        'fun and relaxing anniversary trip for a couple'
-    """
-    print("\n[update_metadata_tool] Called")
-
-    updated = {k: v for k, v in {
-        "city": city,
-        "state": state,
-        "country": country,
-        "price_level": price_level,
-        "interests": interests,
-        "vibe": vibe,
-        "semantic_query": semantic_query,
-    }.items() if v is not None}
-
-    print(f"[update_metadata_tool] Result: {json.dumps(updated, indent=2)}")
-    return json.dumps(updated)
-
-
-@tool
-def check_if_place_exists_tool(city: Optional[str] = None, state: Optional[str] = None, country: Optional[str] = None) -> str:
-    """
-    Checks if a destination exists in the database.
-    Always call this after update_metadata_tool before searching for attractions.
-    Returns exists=true/false and place_id if found.
-
-    - city: preferred for lookup when available
-    - state: used as fallback if no city provided
-    - country: used as fallback if no city or state provided
-    """
-    print(f"\n[check_if_place_exists_tool] Checking: city={city}, state={state}, country={country}")
-
-    if not any([city, state, country]):
-        return json.dumps({"exists": False, "reason": "No location provided"})
-
-    query = supabase.table("place").select("place_id, place_city, place_stateprovince, place_countryregion")
-
-    if city:
-        query = query.ilike("place_city", city)
-    elif state:
-        query = query.ilike("place_stateprovince", state)
-    elif country:
-        query = query.ilike("place_countryregion", country)
-
-    result = query.execute()
-
-    if result.data:
-        place_id = result.data[0]["place_id"]
-        print(f"[check_if_place_exists_tool] Found — place_id={place_id}")
-        return json.dumps({"exists": True, "place_id": place_id})
-
-    print(f"[check_if_place_exists_tool] Not found in DB")
-    return json.dumps({"exists": False})
-
-
-@tool
-def add_place_to_db_tool(city: Optional[str] = None, state: Optional[str] = None, country: Optional[str] = None) -> str:
-    """
-    Adds a new destination to the database.
-    Only call this when check_if_place_exists_tool returns exists=false.
-    Returns the new place_id to use in subsequent calls.
-    """
-    print(f"\n[add_place_to_db_tool] Adding: city={city}, state={state}, country={country}")
-
-    latitude, longitude = None, None
-    coords = geocode(f"{city}, {state}, {country}" if state else f"{city}, {country}")
-    if coords:
-        latitude, longitude = coords
-
-    row = {
-        "place_type": ["city"],
-        "place_city": city,
-        "place_stateprovince": state,
-        "place_countryregion": country,
-        "place_latitude": latitude,
-        "place_longitude": longitude,
-    }
-
-    try:
-        result = supabase.table("place").insert(row).execute()
-        place_id = result.data[0]["place_id"]
-        print(f"[add_place_to_db_tool] Saved successfully — place_id={place_id}")
-        return json.dumps({"success": True, "place_id": place_id})
-    except Exception as e:
-        print(f"[add_place_to_db_tool] Error: {e}")
-        return json.dumps({"success": False, "reason": str(e)})
-
-
-@tool
-def search_attractions_tool(metadata: dict) -> str:
-    """
-    Searches the database for attractions matching the current context.
-    Only call this after check_if_place_exists_tool returns exists=true.
-    Returns results and valid_attractions_found=true/false.
-    If valid_attractions_found=false, returns existing_attraction_names for deduplication —
-    pass these to add_attractions_to_db_tool to avoid adding duplicates.
-    """
-    print(f"\n[search_attractions_tool] Called")
-
-    city = metadata.get("city") or None
-    state = metadata.get("state") or None
-    country = metadata.get("country") or None
-    price_level = metadata.get("price_level")
-    interests = metadata.get("interests") or []
-    vibe = metadata.get("vibe") or []
-
-    semantic_query = metadata.get("semantic_query") or (
-        ", ".join(interests + vibe) if (interests or vibe) else "things to do"
-    )
-
-    print(f"[search_attractions_tool] Filters — city={city}, state={state}, country={country}, price_level={price_level}")
-    print(f"[search_attractions_tool] Semantic query: \"{semantic_query}\"")
-
-    embedding = embed(semantic_query)
-
-    result = supabase.rpc("match_attractions", {
-        "query_embedding": embedding,
-        "filter_city": city,
-        "filter_state": state,
-        "filter_country": country,
-        "filter_price_level": price_level,
-        "match_count": 100
-    }).execute()
-
-    print(f"[search_attractions_tool] {len(result.data)} attractions returned")
-
-    if result.data:
-        return json.dumps({"results": result.data, "valid_attractions_found": True})
-
-    print(f"[search_attractions_tool] No results — fetching existing attractions for deduplication")
-
-    existing = supabase.rpc("match_attractions", {
-        "query_embedding": embedding,
-        "filter_city": city,
-        "filter_state": state,
-        "filter_country": country,
-        "filter_price_level": None,
-        "match_count": 200
-    }).execute()
-
-    existing_names = [a.get("attraction_name") for a in existing.data] if existing.data else []
-    print(f"[search_attractions_tool] {len(existing_names)} existing attractions found for deduplication")
-
-    return json.dumps({
-        "results": [],
-        "valid_attractions_found": False,
-        "existing_attraction_names": existing_names
-    })
-
-
-@tool
-def add_attractions_to_db_tool(place_id: str, attractions: list) -> str:
-    """
-    Saves a list of attractions to the database, linked to a place.
-    Only call this when search_attractions_tool returns valid_attractions_found=false,
-    or when adding a new place for the first time after add_place_to_db_tool.
-    Requires place_id from check_if_place_exists_tool or add_place_to_db_tool.
+    Resolves a list of attractions to real database IDs, checking for duplicates
+    and creating new records as needed. Call this BEFORE save_itinerary_tool 
+    when adding attractions to the itinerary.
 
     Each attraction must include:
     - name (str)
-    - description (str)
-    - city (str)
+    - city (str) — must be the nearest large, well-known city. Never use the 
+      attraction name, an island name, region, or small obscure town.
+      (e.g. Chichen Itza → 'Cancun')
     - state (str, if applicable)
     - country (str) — full country name, never abbreviated
+    - description (str)
     - price_level (int, 0=free, 1=cheap, 2=moderate, 3=expensive, 4=luxury)
-    - vibe (list of strings, e.g. ['romantic', 'adventurous', 'family-friendly'])
+    - vibe (list of strings, e.g. ['romantic', 'adventurous'])
     - latitude (float)
     - longitude (float)
     - popularity_score (float, 0-100)
     - raw_data (dict with any relevant details such as hours, price_text, website, tips)
 
-    - place_id must be a real integer from check_if_place_exists_tool or add_place_to_db_tool results, never a placeholder string
+    Returns a list of resolved attractions with their real attraction_id values
+    to be used directly in save_itinerary_tool.
     """
-    print(f"\n[add_attractions_to_db_tool] Called — place_id={place_id}, {len(attractions)} attractions provided")
+    print(f"[resolve_attractions_tool] Resolving {len(attractions)} attractions")
 
-    if not attractions:
-        return json.dumps({"success": False, "reason": "No attractions provided"})
+    # Step 1 — batch all embeddings in one API call
+    valid_attractions = [a for a in attractions if a.get("name") and a.get("city") and a.get("country")]
+    texts = [f"{a.get('name')}. {a.get('description', '')}" for a in valid_attractions]
+    response = openai_client.embeddings.create(input=texts, model="text-embedding-3-small")
+    embeddings = [r.embedding for r in response.data]
 
-    next_canonical_id = get_next_canonical_id()
+    # Step 2 — parallel DB calls, one per attraction
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        futures = {
+            executor.submit(search_single_attraction, a.get("name"), a.get("country"), emb): a
+            for a, emb in zip(valid_attractions, embeddings)
+        }
+        batch_data = [future.result() for future in as_completed(futures)]
 
-    place_result = supabase.table("place").select("place_latitude, place_longitude").eq("place_id", place_id).execute()
-    place_lat = place_result.data[0].get("place_latitude") if place_result.data else None
-    place_lng = place_result.data[0].get("place_longitude") if place_result.data else None
+    print(f"[resolve] Vector search raw results:")
+    for item in batch_data:
+        candidates = [
+            f"{c.get('attraction_name')} (id={c.get('attraction_id')}, sim={c.get('similarity', 0):.3f})"
+            for c in item.get('candidates', [])
+        ]
+        print(f"  query='{item.get('input_name')}' → candidates: {candidates}")
 
-    rows = []
-    for i, a in enumerate(attractions):
+    # Step 3 — one LLM call to decide matches
+    check_prompt = [
+        SystemMessage(content=(
+            "You are helping deduplicate a travel attractions database. "
+            "For each item, you are given an input_name and a list of candidates with their names, cities, countries, and similarity scores. "
+            "Rules:\n"
+            "- If ANY candidate has an attraction_name that exactly matches the input_name (case-insensitive), you MUST return match: true for that candidate.\n"
+            "- If a candidate name is clearly the same place with minor wording differences (e.g. 'Snorkeling at X' vs 'X'), return match: true.\n"
+            "- Use city and country only as a loose sanity check — nearby cities are acceptable.\n"
+            "- Only return match: false if NO candidate is plausibly the same physical location.\n"
+            "Return JSON only as a list: [{\"name\": \"<input_name value>\", \"match\": true/false, \"attraction_id\": <id or null>}]"
+        )),
+        HumanMessage(content=f"Attractions to check:\n{json.dumps(batch_data, indent=2)}")
+    ]
+
+    check_result = model.invoke(check_prompt)
+
+    try:
+        content = check_result.content.strip()
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        match_data = json.loads(content.strip())
+        matches = {m["name"]: m.get("attraction_id") for m in match_data if m.get("match")}
+        print(f"[resolve] LLM parsed matches: {matches}")
+    except Exception as e:
+        print(f"[resolve] ⚠️  LLM dedup parse FAILED: {e}")
+        print(f"[resolve] Raw content that failed to parse: {check_result.content!r}")
+        matches = {}
+
+    # Step 4 — resolve each attraction
+    canonical_base = get_next_canonical_id()
+    new_attraction_count = 0
+    resolved = []
+
+    for a, embedding in zip(valid_attractions, embeddings):
         name = a.get("name")
         city = a.get("city")
         country = a.get("country")
 
-        if not name or not country:
-            print(f"[add_attractions_to_db_tool] Skipping incomplete entry: {a}")
-            continue
+        attraction_id = matches.get(name)
 
-        coords = geocode(f"{name}, {city}, {country}")
-        attraction_lat = coords[0] if coords else a.get("latitude")
-        attraction_lng = coords[1] if coords else a.get("longitude")
+        if attraction_id:
+            print(f"[resolve] ✓ MATCHED '{name}' → reusing attraction_id={attraction_id}")
+        else:
+            print(f"[resolve] ✗ NO MATCH for '{name}' (city={city}, country={country}) — will insert new record")
+            place_id = ensure_place_exists(city, a.get("state"), country)
+            if not place_id:
+                print(f"[resolve] ⚠️  Could not resolve place for '{name}' — skipping")
+                continue
+            attraction_id = add_attraction(place_id, a, embedding, canonical_base + new_attraction_count)
+            if attraction_id:
+                print(f"[resolve] + Created new attraction_id={attraction_id} for '{name}'")
+                new_attraction_count += 1
+            else:
+                print(f"[resolve] ⚠️  add_attraction returned None for '{name}'")
 
-        description = a.get("description", "")
-        embedding = embed(f"{name}. {description}")
+        if attraction_id:
+            resolved.append({
+                "attraction_id": attraction_id,
+                "attraction_name": name,
+                "attraction_city": city,
+            })
 
-        rows.append({
-            "place_id": place_id,
-            "attraction_name": name,
-            "attraction_summary": description,
-            "attraction_city": city,
-            "attraction_stateprovince": a.get("state"),
-            "attraction_countryregion": country,
-            "attraction_pricelevel": a.get("price_level"),
-            "attraction_vibe": a.get("vibe", []),
-            "attraction_latitude": attraction_lat,
-            "attraction_longitude": attraction_lng,
-            "attraction_distancefromplace": haversine_distance(place_lat, place_lng, attraction_lat, attraction_lng),
-            "attraction_popularityscore": a.get("popularity_score"),
-            "attraction_rawdata": a.get("raw_data", {}),
-            "attraction_lastrefreshed": datetime.now(timezone.utc).isoformat(),
-            "attraction_embedding": embedding,
-            "canonical_id": next_canonical_id + i,
-        })
+    print(f"[resolve_attractions_tool] Resolved {len(resolved)} attractions")
+    return json.dumps({"resolved": resolved})
 
-    if not rows:
-        return json.dumps({"success": False, "reason": "No valid attractions to save"})
-
-    try:
-        result = supabase.table("attraction").insert(rows).execute()
-        print(f"[add_attractions_to_db_tool] Saved {len(rows)} attractions successfully")
-
-        attraction_payloads = [
-            {
-                "attraction_id": inserted.get("attraction_id"),
-                "place_id": place_id,
-                "name": saved_row["attraction_name"],
-                "city": saved_row.get("attraction_city"),
-                "country": saved_row.get("attraction_countryregion"),
-            }
-            for saved_row, inserted in zip(rows, result.data)
-            if inserted.get("attraction_id")
-        ]
-
-        lambda_client.invoke(
-            FunctionName=os.getenv("IMAGE_LAMBDA_NAME"),
-            InvocationType="Event",
-            Payload=json.dumps({"attractions": attraction_payloads})
-        )
-        print(f"[add_attractions_to_db_tool] Image Lambda invoked for {len(attraction_payloads)} attractions")
-
-        return json.dumps({"success": True, "saved": len(rows)})
-    except Exception as e:
-        print(f"[add_attractions_to_db_tool] Error: {e}")
-        return json.dumps({"success": False, "reason": str(e)})
-    
 
 @tool
 def save_itinerary_tool(itinerary_id: str, days: Optional[list] = None, trip_name: Optional[str] = None, start_date: Optional[str] = None,
     end_date: Optional[str] = None, notes: Optional[str] = None, unscheduled: Optional[list] = None, place: Optional[list] = None,) -> str:
     """
-    Saves updates to the itinerary. Pass only the fields that need to be changed — omit the rest.
+    Saves updates to the itinerary. Only pass fields that are actually changing — omit the rest.
     Never call this unless the user has explicitly requested a change.
     Creates the itinerary if it doesn't exist, otherwise updates it.
 
-    IMPORTANT: The following fields are required and must ALWAYS be included in every save:
-    - trip_name: use a descriptive name based on the destinations if not already set
-    - start_date: use a reasonable default (e.g. '2026-01-01') if not specified by the user
-    - end_date: use a reasonable default if not specified by the user
-    - unscheduled: pass [] if there are no unscheduled attractions
-
     - itinerary_id: the id of the itinerary to update, found in the itinerary context
-    - days: full updated days array. Must include ALL days even if unchanged. Structure:
+    - trip_name: short descriptive name for the trip based on destinations
+    - start_date / end_date: trip dates in YYYY-MM-DD format. Use nearest future dates if not specified.
+    - days: only pass if modifying the schedule. Must include ALL days even if only one changed. Structure:
         [{ "dayNumber": 1, "stops": [{ "attractionId": 123, "startTime": "09:00", "durationMinutes": 90 }] }]
-        Rules: attractionId must be a real integer from search_attractions_tool (never null or guessed),
-        startTime in HH:MM 24-hour format, durationMinutes as integer, stops: [] for empty days.
-        When adding or removing days:
-        - Update start_date and end_date to reflect the new trip duration.
-        - Update the place array if the new day is in a different city than existing days.
-        - Always pass days, start_date, end_date, and place together when the number of days changes.
-    - trip_name: short descriptive name for the trip
-    - start_date / end_date: trip dates in YYYY-MM-DD format
+        - attractionId must be a real integer returned by resolve_attractions_tool, never null or guessed
+        - startTime in HH:MM 24-hour format, durationMinutes as integer, stops: [] for empty days
+        - When adding or removing days, always update start_date, end_date, and place together
+        - When removing a day, move its stops to unscheduled before removing
+    - unscheduled: only pass if explicitly adding or removing items. Each item: {attractionId: int, attractionName: str}.
+        When scheduling an unscheduled attraction onto a day, pass both updated days AND updated unscheduled with that attraction removed.
     - notes: free-text field for additional trip details or reminders
-    - unscheduled: attractions not yet assigned to a day, each with attractionId (int) and 
-        attractionName (str). If the user adds an attraction without specifying a day or time, 
-        add it here instead of the days array. Always preserve existing unscheduled items — 
-        pass the full updated list, not just the new item.
-    - place: list of place objects, each with placeId (str) and placeName (str)
+    - place: list of destination cities the user explicitly mentioned, each with:
+        - placeName (str): the city name
+        - placeCountry (str): the country name
+      Do NOT include nearby cities just because an attraction is located there.
+      The placeId will be resolved automatically — do not include it.
     """
     print(f"\n[save_itinerary_tool] Saving itinerary {itinerary_id}")
 
@@ -535,6 +464,17 @@ def save_itinerary_tool(itinerary_id: str, days: Optional[list] = None, trip_nam
         "unscheduled": unscheduled,
         "place": place,
     }.items() if v is not None}
+
+    if place:
+        resolved_place = []
+        for p in place:
+            place_name = p.get("placeName")
+            place_country = p.get("placeCountry")
+            if place_name and place_country:
+                place_id = ensure_place_exists(place_name, p.get("placeState"), place_country)
+                if place_id:
+                    resolved_place.append({"placeId": place_id, "placeName": place_name})
+        updates["place"] = resolved_place
 
     if not updates:
         return json.dumps({"success": False, "reason": "No fields provided to update"})
@@ -552,11 +492,7 @@ def save_itinerary_tool(itinerary_id: str, days: Optional[list] = None, trip_nam
     
 
 tools = [
-    update_metadata_tool,
-    check_if_place_exists_tool,
-    add_place_to_db_tool,
-    search_attractions_tool,
-    add_attractions_to_db_tool,
+    resolve_attractions_tool,
     save_itinerary_tool
 ]
 tools_by_name = {tool.name: tool for tool in tools}
@@ -576,13 +512,14 @@ def llm_call(state: dict):
         "llm_calls": state.get("llm_calls", 0) + 1,
     }
 
+
 def tool_node(state: dict):
     """Execute tool calls requested by the LLM"""
     tool_messages = []
     last_message = state["messages"][-1]
-    new_metadata = state.get("metadata", {})
     itinerary_saved = state.get("itinerary_saved", False)
-    last_search_results = state.get("last_search_results", [])
+    itinerary = state.get("itinerary")
+    itinerary_id = itinerary.get("itinerary_id") if itinerary else None
 
     for tool_call in last_message.tool_calls:
         print(f"\n[tool_node] Dispatching: {tool_call['name']}")
@@ -592,56 +529,17 @@ def tool_node(state: dict):
             continue
 
         if tool_call["name"] == "save_itinerary_tool":
+            tool_call["args"]["itinerary_id"] = itinerary_id
             itinerary_saved = True
 
-        if tool_call["name"] == "search_attractions_tool":
-            args = {"metadata": new_metadata}
-        elif tool_call["name"] == "check_if_place_exists_tool":
-            args = {
-                "city": new_metadata.get("city"),
-                "state": new_metadata.get("state"),
-                "country": new_metadata.get("country"),
-            }
-        elif tool_call["name"] == "add_place_to_db_tool":
-            args = {
-                "city": new_metadata.get("city"),
-                "state": new_metadata.get("state"),
-                "country": new_metadata.get("country"),
-            }
-        else:
-            args = tool_call["args"]
-
-        observation = tool.invoke(args)
-
-        if tool_call["name"] == "update_metadata_tool":
-            try:
-                new_values = json.loads(observation)
-                new_metadata = {**new_metadata, **new_values}
-            except:
-                pass
-
-        if tool_call["name"] == "search_attractions_tool":
-            try:
-                results = json.loads(observation)
-                new_results = results.get("results", [])
-
-                trimmed = [
-                {
-                    "attraction_id": r.get("attraction_id"),
-                    "attraction_name": r.get("attraction_name"),
-                    "attraction_city": r.get("attraction_city")
-                }
-                for r in new_results
-            ]
-                last_search_results = last_search_results + trimmed
-            except:
-                pass
+        observation = tool.invoke(tool_call["args"])
 
         tool_messages.append(
             ToolMessage(content=observation, tool_call_id=tool_call["id"])
         )
 
-    return {"messages": tool_messages, "metadata": new_metadata, "itinerary_saved": itinerary_saved, "last_search_results": last_search_results}
+    return {"messages": tool_messages, "itinerary_saved": itinerary_saved}
+
 
 def should_continue(state: MessagesState) -> Literal["tool_node", END]:
     """Decide if we should continue the loop or stop"""
@@ -712,7 +610,7 @@ def lambda_handler(event, context):
         db_session = (
             supabase
             .table("sessions")
-            .select("summary, updated_at, metadata, last_search_results")
+            .select("summary, updated_at")
             .eq("session_id", session_id)
             .execute()
         )
@@ -721,13 +619,9 @@ def lambda_handler(event, context):
             supabase.table("sessions").insert({"session_id": session_id}).execute()
             summary = ""
             last_summary_time = None
-            metadata = {}
-            last_search_results = []
         else:
             summary = db_session.data[0].get("summary") or ""
             last_summary_time = db_session.data[0].get("updated_at")
-            metadata = db_session.data[0].get("metadata") or {}
-            last_search_results = db_session.data[0].get("last_search_results") or []
 
         # --- Message history ---
         db_messages = (
@@ -746,13 +640,10 @@ def lambda_handler(event, context):
         messages = [
             SystemMessage(content=SYSTEM_PROMPT),
             SystemMessage(content=f"Today's date is {datetime.now(timezone.utc).strftime('%B %d, %Y')}. Use this as context when the user mentions travel dates without specifying a year — assume the nearest future date."),
-            SystemMessage(content=f"Current metadata: {json.dumps(metadata)}")
         ]
 
         if summary:
             messages.append(SystemMessage(content=f"Summary of conversation so far (use as context, prioritize recent messages):\n\n{summary}"))
-        if last_search_results:
-            messages.append(SystemMessage(content=f"Most recent attraction search results — use the attraction_id field when saving to the itinerary:\n{json.dumps(last_search_results, indent=2)}"))
 
         # --- Load itinerary ---
         itinerary = None
@@ -784,18 +675,12 @@ def lambda_handler(event, context):
         result = agent.invoke({
             "messages": messages, 
             "llm_calls": 0, 
-            "metadata": metadata, 
             "itinerary": itinerary,
             "itinerary_saved": False,
-            "last_search_results": last_search_results
         })
 
-        # --- Persist metadata ---
-        new_search_results = result.get("last_search_results", [])
-
         supabase.table("sessions").update({
-            "metadata": result.get("metadata", metadata),
-            **({"last_search_results": new_search_results} if new_search_results else {})
+            "updated_at": datetime.now(timezone.utc).isoformat()
         }).eq("session_id", session_id).execute()
 
         # --- Final message ---
